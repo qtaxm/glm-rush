@@ -352,6 +352,7 @@
         const url = typeof input === 'string' ? input : input?.url;
 
         if (url && url.includes(CFG.PREVIEW)) {
+            // 捕获请求参数
             const captured = {
                 url,
                 method: init?.method || 'POST',
@@ -360,17 +361,14 @@
             };
             setState({ captured });
             try { sessionStorage.setItem('glm_rush_captured', JSON.stringify(captured)); } catch {}
-            log('捕获 preview (Fetch)');
 
-            // 自动设定抢购定时（如果还没设定且未在抢购中）
-            autoScheduleIfNeeded();
-
-            // 已经成功过 → 直接返回缓存，不再重试
+            // 已经成功过 → 直接返回缓存
             if (state.status === 'success' && state.lastSuccess) {
                 log('已抢到, 返回成功响应');
                 return new Response(state.lastSuccess.text, { status: 200, headers: { 'Content-Type': 'application/json' } });
             }
 
+            // 有缓存 → 返回（来自主动模式成功后的恢复）
             if (state.cache) {
                 log('返回缓存响应');
                 const c = state.cache;
@@ -379,15 +377,23 @@
                 return new Response(c.text, { status: 200, headers: { 'Content-Type': 'application/json' } });
             }
 
-            const result = await retry(url, {
-                method: init?.method || 'POST',
-                body: init?.body,
-                headers: extractHeaders(init?.headers),
-            });
-
-            if (result.ok) {
-                return new Response(result.text, { status: result.status, headers: { 'Content-Type': 'application/json' } });
+            // 主动模式/正在抢购 → 进入重试引擎
+            if (state.proactive || state.status === 'retrying') {
+                log('抢购中, 启动重试...');
+                const result = await retry(url, {
+                    method: init?.method || 'POST',
+                    body: init?.body,
+                    headers: extractHeaders(init?.headers),
+                });
+                if (result.ok) {
+                    return new Response(result.text, { status: result.status, headers: { 'Content-Type': 'application/json' } });
+                }
+                return _fetch.apply(this, [input, init]);
             }
+
+            // 普通捕获 → 只记录参数，放行原始请求，自动设定定时
+            log('已捕获请求参数, 等待抢购时间...');
+            autoScheduleIfNeeded();
             return _fetch.apply(this, [input, init]);
         }
 
@@ -426,10 +432,6 @@
             const captured = { url, method: this._m, body, headers: this._h || {} };
             setState({ captured });
             try { sessionStorage.setItem('glm_rush_captured', JSON.stringify(captured)); } catch {}
-            log('捕获 preview (XHR)');
-
-            // 自动设定抢购定时
-            autoScheduleIfNeeded();
 
             // 已经成功过 → 直接返回缓存
             if (state.status === 'success' && state.lastSuccess) {
@@ -446,10 +448,19 @@
                 return;
             }
 
-            retry(url, { method: this._m, body, headers: this._h || {} }).then(result => {
-                fakeXHR(self, result.ok ? result.text : '{"code":-1,"msg":"重试失败"}');
-            });
-            return;
+            // 主动模式/正在抢购 → 重试
+            if (state.proactive || state.status === 'retrying') {
+                log('抢购中, 启动重试 (XHR)...');
+                retry(url, { method: this._m, body, headers: this._h || {} }).then(result => {
+                    fakeXHR(self, result.ok ? result.text : '{"code":-1,"msg":"重试失败"}');
+                });
+                return;
+            }
+
+            // 普通捕获 → 放行原始请求，自动设定定时
+            log('已捕获请求参数, 等待抢购时间...');
+            autoScheduleIfNeeded();
+            return _xhrSend.call(this, body);
         }
 
         if (typeof url === 'string' && url.includes(CFG.CHECK) && url.includes('bizId=null')) {

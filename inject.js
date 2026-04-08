@@ -15,6 +15,7 @@
         jitter: 0.3,          // 间隔随机抖动 ±30%
         recoveryMax: 3,       // 弹窗恢复最大次数
         logMax: 100,          // 日志条数上限
+        rushTime: '10:00:00',     // 每天抢购时间 (北京时间)
         PREVIEW: '/api/biz/pay/preview',
         CHECK: '/api/biz/pay/check',
     };
@@ -339,6 +340,7 @@
         const url = typeof input === 'string' ? input : input?.url;
 
         if (url && url.includes(CFG.PREVIEW)) {
+            // 捕获请求参数
             const captured = {
                 url,
                 method: init?.method || 'POST',
@@ -347,14 +349,14 @@
             };
             setState({ captured });
             try { sessionStorage.setItem('glm_rush_captured', JSON.stringify(captured)); } catch {}
-            log('捕获 preview (Fetch)');
 
-            // 已经成功过 → 直接返回缓存，不再重试
+            // 已经成功过 → 直接返回缓存
             if (state.status === 'success' && state.lastSuccess) {
                 log('已抢到, 返回成功响应');
                 return new Response(state.lastSuccess.text, { status: 200, headers: { 'Content-Type': 'application/json' } });
             }
 
+            // 有缓存 → 返回（来自主动模式成功后的恢复）
             if (state.cache) {
                 log('返回缓存响应');
                 const c = state.cache;
@@ -363,15 +365,23 @@
                 return new Response(c.text, { status: 200, headers: { 'Content-Type': 'application/json' } });
             }
 
-            const result = await retry(url, {
-                method: init?.method || 'POST',
-                body: init?.body,
-                headers: extractHeaders(init?.headers),
-            });
-
-            if (result.ok) {
-                return new Response(result.text, { status: result.status, headers: { 'Content-Type': 'application/json' } });
+            // 主动模式/正在抢购 → 进入重试引擎
+            if (state.proactive || state.status === 'retrying') {
+                log('抢购中, 启动重试...');
+                const result = await retry(url, {
+                    method: init?.method || 'POST',
+                    body: init?.body,
+                    headers: extractHeaders(init?.headers),
+                });
+                if (result.ok) {
+                    return new Response(result.text, { status: result.status, headers: { 'Content-Type': 'application/json' } });
+                }
+                return _fetch.apply(this, [input, init]);
             }
+
+            // 普通捕获 → 只记录参数，放行原始请求，自动设定定时
+            log('已捕获请求参数, 等待抢购时间...');
+            autoScheduleIfNeeded();
             return _fetch.apply(this, [input, init]);
         }
 
@@ -410,7 +420,6 @@
             const captured = { url, method: this._m, body, headers: this._h || {} };
             setState({ captured });
             try { sessionStorage.setItem('glm_rush_captured', JSON.stringify(captured)); } catch {}
-            log('捕获 preview (XHR)');
 
             // 已经成功过 → 直接返回缓存
             if (state.status === 'success' && state.lastSuccess) {
@@ -427,10 +436,19 @@
                 return;
             }
 
-            retry(url, { method: this._m, body, headers: this._h || {} }).then(result => {
-                fakeXHR(self, result.ok ? result.text : '{"code":-1,"msg":"重试失败"}');
-            });
-            return;
+            // 主动模式/正在抢购 → 重试
+            if (state.proactive || state.status === 'retrying') {
+                log('抢购中, 启动重试 (XHR)...');
+                retry(url, { method: this._m, body, headers: this._h || {} }).then(result => {
+                    fakeXHR(self, result.ok ? result.text : '{"code":-1,"msg":"重试失败"}');
+                });
+                return;
+            }
+
+            // 普通捕获 → 放行原始请求，自动设定定时
+            log('已捕获请求参数, 等待抢购时间...');
+            autoScheduleIfNeeded();
+            return _xhrSend.call(this, body);
         }
 
         if (typeof url === 'string' && url.includes(CFG.CHECK) && url.includes('bizId=null')) {
@@ -611,11 +629,15 @@
     async function startProactive() {
         if (!state.captured) {
             log('请先手动点一次购买按钮');
-            alert('请先手动点一次购买按钮，让脚本捕获请求参数');
+            alert('请先手动点一次购买/订阅按钮，让脚本捕获请求参数');
+            return;
+        }
+        if (state.status === 'success') {
+            log('已经抢到了, 不重复抢购');
             return;
         }
         setState({ proactive: true });
-        log('主动抢购启动 (并发=' + CFG.concurrency + ')');
+        log(`极速抢购启动! 前${CFG.turboSec}秒${CFG.turboConcurrency}路并发, 之后${CFG.concurrency}路`);
 
         const { url, method, body, headers } = state.captured;
         const result = await retry(url, { method, body, headers });
@@ -623,11 +645,13 @@
 
         if (result.ok) {
             setState({ cache: { text: result.text, data: result.data } });
-            log('主动模式成功!');
+            log('抢购成功! 触发支付...');
+            // 自动通知
+            try { new Notification('GLM 抢购成功!', { body: `bizId=${state.bizId}` }); } catch {}
             const errDlg = findErrorDialog();
             if (errDlg) { dismissDialog(errDlg); await sleep(300); }
             const btn = findBuyButton();
-            if (btn) { btn.click(); log('已点击购买按钮'); }
+            if (btn) { btn.click(); log('已自动点击购买按钮'); }
             else { alert('已获取到商品! 请立即点击购买按钮!'); }
         }
     }
@@ -635,40 +659,118 @@
     function stopAll() {
         stopRequested = true;
         setState({ proactive: false, status: 'idle', count: 0 });
-        if (state.timerId) { clearTimeout(state.timerId); setState({ timerId: null }); }
+        if (state.timerId) { clearInterval(state.timerId); setState({ timerId: null }); }
         log('已停止');
     }
 
-    // 高精度定时
-    function scheduleAt(timeStr) {
-        if (state.timerId) { clearTimeout(state.timerId); setState({ timerId: null }); }
-        const parts = timeStr.split(':').map(Number);
-        const now = new Date();
-        const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), parts[0], parts[1], parts[2] || 0);
-        if (target <= now) { log('目标时间已过'); return; }
-        const ms = target - now;
-        log(`定时: ${timeStr} (${Math.ceil(ms / 1000)}秒后)`);
+    // ═══════════════════════════════════════════
+    //  北京时间同步 + 自动定时
+    // ═══════════════════════════════════════════
+    let serverTimeOffset = 0; // 本地时间与服务器时间的差值(ms)
 
-        // 提前500ms开始用rAF精确等待
-        const earlyMs = Math.max(0, ms - 500);
-        const tid = setTimeout(() => {
-            const targetTs = performance.now() + 500;
-            function tick() {
-                if (performance.now() >= targetTs) {
-                    log('时间到! 启动抢购!');
-                    setState({ timerId: null });
-                    if (state.captured) startProactive();
-                    else {
-                        const btn = findBuyButton();
-                        if (btn) btn.click();
-                        else alert('定时到了! 请手动点击购买!');
-                    }
-                    return;
-                }
-                requestAnimationFrame(tick);
+    async function syncServerTime() {
+        // 用服务器响应头的 Date 字段同步时间
+        try {
+            const t0 = Date.now();
+            const resp = await _fetch(location.origin + '/api/biz/pay/check?bizId=sync', { credentials: 'include' }).catch(() => null);
+            const t1 = Date.now();
+            const rtt = t1 - t0;
+
+            if (resp && resp.headers.get('date')) {
+                const serverTime = new Date(resp.headers.get('date')).getTime();
+                // 服务器时间 ≈ 发送时间 + RTT/2
+                serverTimeOffset = serverTime - (t0 + rtt / 2);
+                const localNow = new Date(Date.now() + serverTimeOffset);
+                log(`时间同步: 服务器偏差 ${serverTimeOffset > 0 ? '+' : ''}${serverTimeOffset}ms (RTT=${rtt}ms)`);
+                log(`北京时间: ${localNow.toLocaleTimeString('zh-CN', { hour12: false })}`);
+                return;
             }
-            requestAnimationFrame(tick);
-        }, earlyMs);
+        } catch {}
+
+        // 备用: 用 worldtimeapi
+        try {
+            const resp = await fetch('https://worldtimeapi.org/api/timezone/Asia/Shanghai');
+            const data = await resp.json();
+            const serverTime = new Date(data.datetime).getTime();
+            serverTimeOffset = serverTime - Date.now();
+            log(`时间同步(备用): 偏差 ${serverTimeOffset > 0 ? '+' : ''}${serverTimeOffset}ms`);
+        } catch {
+            log('时间同步失败, 使用本地时钟');
+            serverTimeOffset = 0;
+        }
+    }
+
+    function getServerNow() {
+        return Date.now() + serverTimeOffset;
+    }
+
+    /** 捕获请求后自动设定今天的抢购定时 */
+    function autoScheduleIfNeeded() {
+        if (state.timerId) return;           // 已经设定了
+        if (state.status === 'retrying') return; // 正在抢
+        if (state.status === 'success') return;  // 已经抢到了
+
+        const parts = CFG.rushTime.split(':').map(Number);
+        const now = new Date(getServerNow());
+        const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), parts[0], parts[1], parts[2] || 0);
+
+        if (target.getTime() <= getServerNow()) {
+            // 已过今天的抢购时间 → 直接开始抢（可能正好在抢购窗口内）
+            const passedSec = (getServerNow() - target.getTime()) / 1000;
+            if (passedSec < 30) {
+                // 过了不到30秒，还在窗口内，直接开抢
+                log(`已过${CFG.rushTime} ${passedSec.toFixed(0)}秒, 立即开抢!`);
+                startProactive();
+            } else {
+                log(`今天${CFG.rushTime}已过, 明天自动抢购`);
+            }
+            return;
+        }
+
+        // 未到时间 → 自动设定定时
+        scheduleAt(CFG.rushTime);
+        log(`已自动设定 ${CFG.rushTime} 抢购`);
+    }
+
+    // 定时到指定时间
+    function scheduleAt(timeStr) {
+        if (state.timerId) { clearInterval(state.timerId); setState({ timerId: null }); }
+        const parts = timeStr.split(':').map(Number);
+        if (parts.length < 2 || parts[0] > 23 || parts[1] > 59) { log('时间格式错误'); return; }
+
+        const now = new Date(getServerNow());
+        const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), parts[0], parts[1], parts[2] || 0);
+        if (target.getTime() <= getServerNow()) { log('目标时间已过'); return; }
+
+        const ms = target.getTime() - getServerNow();
+        log(`定时: ${timeStr} (${Math.ceil(ms / 1000)}秒后, 北京时间)`);
+
+        // 提前3秒自动预热
+        if (ms > 4000) {
+            setTimeout(() => {
+                log('定时前3秒, 自动预热...');
+                preheat();
+            }, Math.max(0, ms - 3000));
+        }
+
+        // 精确等待: 用 setInterval 10ms 检查, 到时间立即启动
+        const tid = setInterval(() => {
+            const remaining = target.getTime() - getServerNow();
+            // 更新面板倒计时
+            if (remaining > 0 && remaining < 60000) {
+                const sec = (remaining / 1000).toFixed(1);
+                const timerEl = _shadowRef?.getElementById('timer-info');
+                if (timerEl) timerEl.textContent = `-${sec}s`;
+            }
+            if (remaining <= 0) {
+                clearInterval(tid);
+                setState({ timerId: null });
+                const timerEl = _shadowRef?.getElementById('timer-info');
+                if (timerEl) timerEl.textContent = '';
+                log('时间到! 自动启动抢购!');
+                startProactive();
+            }
+        }, 10);
 
         setState({ timerId: tid });
     }
@@ -813,9 +915,17 @@
         // 闭包引用供 refreshUI 使用
         _shadowRef = shadow;
 
-        log('v4.0 已加载 (并发重试+反检测+高精度定时)');
-        if (state.captured) log('已恢复上次捕获的请求参数');
+        log('v4.4 已加载 (极速并发+时间同步+全自动抢购)');
+        if (state.captured) log('已恢复上次捕获的请求参数, 可直接设定时间');
         setupDialogWatcher();
+
+        // 自动同步服务器时间
+        syncServerTime();
+
+        // 请求通知权限
+        if (Notification && Notification.permission === 'default') {
+            Notification.requestPermission();
+        }
     }
 
     // ═══════════════════════════════════════════
