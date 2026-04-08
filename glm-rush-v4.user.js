@@ -27,6 +27,7 @@
         jitter: 0.3,          // 间隔随机抖动 ±30%
         recoveryMax: 3,       // 弹窗恢复最大次数
         logMax: 100,          // 日志条数上限
+        rushTime: '10:00:00',     // 每天抢购时间 (北京时间)
         PREVIEW: '/api/biz/pay/preview',
         CHECK: '/api/biz/pay/check',
     };
@@ -361,6 +362,9 @@
             try { sessionStorage.setItem('glm_rush_captured', JSON.stringify(captured)); } catch {}
             log('捕获 preview (Fetch)');
 
+            // 自动设定抢购定时（如果还没设定且未在抢购中）
+            autoScheduleIfNeeded();
+
             // 已经成功过 → 直接返回缓存，不再重试
             if (state.status === 'success' && state.lastSuccess) {
                 log('已抢到, 返回成功响应');
@@ -423,6 +427,9 @@
             setState({ captured });
             try { sessionStorage.setItem('glm_rush_captured', JSON.stringify(captured)); } catch {}
             log('捕获 preview (XHR)');
+
+            // 自动设定抢购定时
+            autoScheduleIfNeeded();
 
             // 已经成功过 → 直接返回缓存
             if (state.status === 'success' && state.lastSuccess) {
@@ -698,7 +705,35 @@
         return Date.now() + serverTimeOffset;
     }
 
-    // 自动定时: 同步时间后自动等待到 10:00:00
+    /** 捕获请求后自动设定今天的抢购定时 */
+    function autoScheduleIfNeeded() {
+        if (state.timerId) return;           // 已经设定了
+        if (state.status === 'retrying') return; // 正在抢
+        if (state.status === 'success') return;  // 已经抢到了
+
+        const parts = CFG.rushTime.split(':').map(Number);
+        const now = new Date(getServerNow());
+        const target = new Date(now.getFullYear(), now.getMonth(), now.getDate(), parts[0], parts[1], parts[2] || 0);
+
+        if (target.getTime() <= getServerNow()) {
+            // 已过今天的抢购时间 → 直接开始抢（可能正好在抢购窗口内）
+            const passedSec = (getServerNow() - target.getTime()) / 1000;
+            if (passedSec < 30) {
+                // 过了不到30秒，还在窗口内，直接开抢
+                log(`已过${CFG.rushTime} ${passedSec.toFixed(0)}秒, 立即开抢!`);
+                startProactive();
+            } else {
+                log(`今天${CFG.rushTime}已过, 明天自动抢购`);
+            }
+            return;
+        }
+
+        // 未到时间 → 自动设定定时
+        scheduleAt(CFG.rushTime);
+        log(`已自动设定 ${CFG.rushTime} 抢购`);
+    }
+
+    // 定时到指定时间
     function scheduleAt(timeStr) {
         if (state.timerId) { clearInterval(state.timerId); setState({ timerId: null }); }
         const parts = timeStr.split(':').map(Number);
