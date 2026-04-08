@@ -5,11 +5,13 @@
     //  配置 (localStorage 持久化)
     // ═══════════════════════════════════════════
     const DEFAULT_CFG = {
-        concurrency: 3,       // 并发路数
+        concurrency: 5,       // 并发路数 (普通模式)
+        turboConcurrency: 10, // 极速模式并发路数
+        turboSec: 5,          // 极速模式持续秒数
         maxRetry: 2000,       // 最大重试次数
-        burstCount: 10,       // 前N次零延迟爆发
-        fastDelay: 50,        // 爆发后的快速间隔
-        slowDelay: 150,       // 后期随机间隔中值
+        burstCount: 20,       // 前N次零延迟爆发
+        fastDelay: 30,        // 爆发后的快速间隔
+        slowDelay: 100,       // 后期随机间隔中值
         jitter: 0.3,          // 间隔随机抖动 ±30%
         recoveryMax: 3,       // 弹窗恢复最大次数
         logMax: 100,          // 日志条数上限
@@ -128,7 +130,15 @@
 
     async function singleAttempt(url, opts, attemptNum) {
         try {
-            const resp = await _fetch(url, { ...opts, credentials: 'include' });
+            // 请求指纹随机化 — 每次请求看起来不一样，降低被识别为脚本的概率
+            const randHeaders = { ...opts.headers };
+            randHeaders['X-Request-Id'] = Math.random().toString(36).slice(2, 15);
+            randHeaders['X-Timestamp'] = String(Date.now());
+            // 随机 Accept-Language 权重，让每次请求指纹不同
+            const q = (0.5 + Math.random() * 0.5).toFixed(1);
+            randHeaders['Accept-Language'] = `zh-CN,zh;q=${q},en;q=${(q * 0.7).toFixed(1)}`;
+
+            const resp = await _fetch(url, { ...opts, headers: randHeaders, credentials: 'include' });
 
             // HTTP 状态码检测
             if (resp.status === 401 || resp.status === 403) {
@@ -191,10 +201,13 @@
             let consecutiveErrors = 0;
             let throttleCount = 0;
             let consecutiveSoldOut = 0;
-            let consecutiveBusy = 0;
 
             while (totalAttempt < CFG.maxRetry && !stopRequested) {
-                const batchSize = Math.min(CFG.concurrency, CFG.maxRetry - totalAttempt);
+                // 极速模式: 前N秒用更高并发
+                const elapsedMs = performance.now() - state.stats.startTime;
+                const isTurbo = elapsedMs < CFG.turboSec * 1000;
+                const curConcurrency = isTurbo ? CFG.turboConcurrency : CFG.concurrency;
+                const batchSize = Math.min(curConcurrency, CFG.maxRetry - totalAttempt);
                 const controllers = [];
                 const promises = [];
 
@@ -276,42 +289,29 @@
                 // EXPIRE → 立即重试不等待
                 if (reasons.every(r => r === 'EXPIRE')) continue;
 
-                // 连续售罄检测 — 非抢购时间不要浪费重试
-                const soldOutCount = reasons.filter(r => r === '售罄').length;
-                const busyCount = reasons.filter(r => r === '系统繁忙').length;
-                if (soldOutCount === batchSize) {
-                    consecutiveSoldOut++;
-                } else {
-                    consecutiveSoldOut = 0;
-                }
-                // 连续全部返回系统繁忙 → 可能不在抢购时间
-                if (busyCount === batchSize) {
-                    consecutiveBusy++;
-                } else {
-                    consecutiveBusy = 0;
-                }
+                // 前20秒全速冲，之后才考虑降速
+                const elapsedSec = (performance.now() - state.stats.startTime) / 1000;
 
-                // 连续5轮全售罄 → 放慢重试 (2秒一次)
-                if (consecutiveSoldOut >= 5) {
-                    if (consecutiveSoldOut === 5) log('连续售罄, 降速重试 (2s间隔)...');
-                    await sleep(2000);
-                    continue;
-                }
-
-                // 连续5轮全系统繁忙 → 可能不在抢购窗口, 放慢到5秒
-                if (consecutiveBusy >= 5) {
-                    if (consecutiveBusy === 5) log('连续系统繁忙, 可能未到抢购时间, 降速 (5s间隔)...');
-                    await sleep(5000);
-                    // 每30轮检查一次是否恢复
-                    if (consecutiveBusy % 30 === 0) {
-                        log(`仍在等待... 已重试${totalAttempt}次 (系统繁忙)`);
+                if (elapsedSec > 20) {
+                    // 超过20秒 — 检测是否该降速
+                    const soldOutCount = reasons.filter(r => r === '售罄').length;
+                    if (soldOutCount === batchSize) {
+                        consecutiveSoldOut++;
+                    } else {
+                        consecutiveSoldOut = 0;
                     }
-                    continue;
+                    // 连续10轮全售罄 → 可能已经抢完了
+                    if (consecutiveSoldOut >= 10) {
+                        if (consecutiveSoldOut === 10) log('连续售罄, 可能已抢完, 降速 (2s)...');
+                        await sleep(2000);
+                        continue;
+                    }
                 }
 
                 // 日志 (前5次 + 每20次)
                 if (totalAttempt <= 5 * CFG.concurrency || totalAttempt % (20 * CFG.concurrency) === 0) {
-                    log(`#${totalAttempt} ${reasons[0]}`);
+                    const sec = elapsedSec.toFixed(0);
+                    log(`#${totalAttempt} ${reasons[0]} (${sec}s)`);
                 }
 
                 // 自适应延迟
@@ -348,6 +348,12 @@
             setState({ captured });
             try { sessionStorage.setItem('glm_rush_captured', JSON.stringify(captured)); } catch {}
             log('捕获 preview (Fetch)');
+
+            // 已经成功过 → 直接返回缓存，不再重试
+            if (state.status === 'success' && state.lastSuccess) {
+                log('已抢到, 返回成功响应');
+                return new Response(state.lastSuccess.text, { status: 200, headers: { 'Content-Type': 'application/json' } });
+            }
 
             if (state.cache) {
                 log('返回缓存响应');
@@ -405,6 +411,13 @@
             setState({ captured });
             try { sessionStorage.setItem('glm_rush_captured', JSON.stringify(captured)); } catch {}
             log('捕获 preview (XHR)');
+
+            // 已经成功过 → 直接返回缓存
+            if (state.status === 'success' && state.lastSuccess) {
+                log('已抢到, 返回成功响应 (XHR)');
+                fakeXHR(self, state.lastSuccess.text);
+                return;
+            }
 
             if (state.cache) {
                 log('返回缓存响应 (XHR)');
@@ -663,9 +676,19 @@
     // 预热
     async function preheat() {
         try {
-            await _fetch(location.origin + '/api/biz/pay/check?bizId=preheat', { credentials: 'include' });
-            log('TCP预热完成');
-        } catch {}
+            log('TCP预热中...');
+            // 连发3次预热请求，确保连接池暖好
+            for (let i = 0; i < 3; i++) {
+                await _fetch(location.origin + '/api/biz/pay/check?bizId=preheat_' + i, { credentials: 'include' }).catch(() => {});
+                await sleep(200);
+            }
+            // 也预热 preview 的 DNS + TCP (用 HEAD 请求不产生副作用)
+            await _fetch(location.origin + CFG.PREVIEW, {
+                method: 'HEAD',
+                credentials: 'include',
+            }).catch(() => {});
+            log('预热完成 (4次连接已建立)');
+        } catch { log('预热部分失败，不影响使用'); }
     }
 
     // ═══════════════════════════════════════════
@@ -729,7 +752,7 @@
 .keys{font-size:10px;color:#636e72;text-align:center;margin-top:6px}
 </style>
 <div class="panel">
-  <div class="hd" id="drag"><b>GLM v4.2</b><button class="mn" id="min">-</button></div>
+  <div class="hd" id="drag"><b>GLM v4.4</b><button class="mn" id="min">-</button></div>
   <div class="bd" id="bd">
     <div class="st st-idle" id="st">等待中</div>
     <div class="cap" id="cap">${state.captured ? '已恢复上次捕获的请求' : '请先点一次购买按钮'}</div>
@@ -739,7 +762,8 @@
       <div><div class="v" id="s-err">0</div>错误</div>
     </div>
     <div class="row">
-      <span>并发</span><input type="number" id="i-conc" value="${CFG.concurrency}" min="1" max="10" step="1">
+      <span>并发</span><input type="number" id="i-conc" value="${CFG.concurrency}" min="1" max="20" step="1">
+      <span>极速</span><input type="number" id="i-turbo" value="${CFG.turboConcurrency}" min="1" max="20" step="1">
       <span>上限</span><input type="number" id="i-max" value="${CFG.maxRetry}" min="10" max="9999" step="50">
     </div>
     <div class="row">
@@ -764,8 +788,9 @@
         $('b-stop').onclick = stopAll;
         $('b-heat').onclick = preheat;
         $('b-time').onclick = () => { const v = $('i-time').value; if (v) scheduleAt(v); };
-        $('i-conc').onchange = function() { CFG.concurrency = Math.max(1, +this.value || 3); saveCfg(CFG); };
-        $('i-max').onchange = function() { CFG.maxRetry = Math.max(10, +this.value || 500); saveCfg(CFG); };
+        $('i-conc').onchange = function() { CFG.concurrency = Math.max(1, +this.value || 5); saveCfg(CFG); };
+        $('i-turbo').onchange = function() { CFG.turboConcurrency = Math.max(1, +this.value || 10); saveCfg(CFG); };
+        $('i-max').onchange = function() { CFG.maxRetry = Math.max(10, +this.value || 2000); saveCfg(CFG); };
         $('min').onclick = function() {
             const bd = $('bd');
             const hidden = bd.style.display === 'none';
@@ -810,8 +835,9 @@
             const stEl = $('st');
             if (stEl) {
                 stEl.className = 'st st-' + state.status;
+                const isTurbo = state.stats.startTime && (performance.now() - state.stats.startTime) < CFG.turboSec * 1000;
                 stEl.textContent = state.status === 'idle' ? '等待中'
-                    : state.status === 'retrying' ? `重试中... ${state.count}/${CFG.maxRetry}`
+                    : state.status === 'retrying' ? `${isTurbo ? '⚡极速' : ''}重试中... ${state.count}/${CFG.maxRetry}`
                     : state.status === 'success' ? `成功! bizId=${state.bizId}`
                     : `失败 (${state.count}次)`;
             }
