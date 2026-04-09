@@ -385,7 +385,11 @@
                     body: init?.body,
                     headers: extractHeaders(init?.headers),
                 });
+                setState({ proactive: false });
                 if (result.ok) {
+                    log('拦截器内抢购成功! 返回响应给前端...');
+                    try { new Notification('GLM 抢购成功!', { body: `bizId=${state.bizId}` }); } catch {}
+                    // 直接返回给前端的 fetch 调用 → 前端会正常弹出支付窗口
                     return new Response(result.text, { status: result.status, headers: { 'Content-Type': 'application/json' } });
                 }
                 return _fetch.apply(this, [input, init]);
@@ -452,6 +456,11 @@
             if (state.proactive || state.status === 'retrying') {
                 log('抢购中, 启动重试 (XHR)...');
                 retry(url, { method: this._m, body, headers: this._h || {} }).then(result => {
+                    setState({ proactive: false });
+                    if (result.ok) {
+                        log('XHR拦截器内抢购成功! 返回响应给前端...');
+                        try { new Notification('GLM 抢购成功!', { body: `bizId=${state.bizId}` }); } catch {}
+                    }
                     fakeXHR(self, result.ok ? result.text : '{"code":-1,"msg":"重试失败"}');
                 });
                 return;
@@ -630,12 +639,34 @@
     // ═══════════════════════════════════════════
     //  主动抢购 & 定时
     // ═══════════════════════════════════════════
+    let _lastClickedBtn = null; // 记住用户点的那个按钮
+
     function findBuyButton() {
+        // 优先返回用户上次点击的同一个按钮
+        if (_lastClickedBtn && _lastClickedBtn.offsetParent !== null) return _lastClickedBtn;
         for (const el of document.querySelectorAll('button, a, [role="button"], div[class*="btn"], span[class*="btn"]')) {
             const t = el.textContent.trim();
             if (/购买|抢购|立即|下单|订阅/.test(t) && t.length < 20 && el.offsetParent !== null) return el;
         }
         return null;
+    }
+
+    // 监听用户点击，记住是哪个按钮
+    document.addEventListener('click', e => {
+        const t = (e.target.textContent || '').trim();
+        if (/购买|抢购|立即|下单|订阅/.test(t) && t.length < 20) {
+            _lastClickedBtn = e.target.closest('button') || e.target;
+            log('记住按钮: ' + t);
+        }
+    }, true);
+
+    function clickButton(btn) {
+        // 多种方式触发点击，确保前端框架能响应
+        btn.focus();
+        btn.dispatchEvent(new MouseEvent('mousedown', { bubbles: true }));
+        btn.dispatchEvent(new MouseEvent('mouseup', { bubbles: true }));
+        btn.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+        btn.click();
     }
 
     async function startProactive() {
@@ -648,23 +679,32 @@
             log('已经抢到了, 不重复抢购');
             return;
         }
+
+        // 核心策略: 设置 proactive=true，然后点击按钮
+        // 让前端自己发 fetch → 拦截器检测到 proactive → 启动重试
+        // 响应直接返回给前端的 fetch 调用 → 前端正常弹出支付窗口
         setState({ proactive: true });
-        log(`极速抢购启动! 前${CFG.turboSec}秒${CFG.turboConcurrency}路并发, 之后${CFG.concurrency}路`);
+        log(`极速抢购启动! 点击按钮触发前端请求...`);
 
-        const { url, method, body, headers } = state.captured;
-        const result = await retry(url, { method, body, headers });
-        setState({ proactive: false });
+        const btn = findBuyButton();
+        if (btn) {
+            clickButton(btn);
+            log('已点击购买按钮, 等待拦截器重试...');
+            // 拦截器会在 fetch/XHR 中自动处理重试
+            // proactive 会在拦截器成功后由 retry 结束时保持
+        } else {
+            // 找不到按钮 → 降级为直接调用方式
+            log('未找到按钮, 降级为直接请求模式...');
+            const { url, method, body, headers } = state.captured;
+            const result = await retry(url, { method, body, headers });
+            setState({ proactive: false });
 
-        if (result.ok) {
-            setState({ cache: { text: result.text, data: result.data } });
-            log('抢购成功! 触发支付...');
-            // 自动通知
-            try { new Notification('GLM 抢购成功!', { body: `bizId=${state.bizId}` }); } catch {}
-            const errDlg = findErrorDialog();
-            if (errDlg) { dismissDialog(errDlg); await sleep(300); }
-            const btn = findBuyButton();
-            if (btn) { btn.click(); log('已自动点击购买按钮'); }
-            else { alert('已获取到商品! 请立即点击购买按钮!'); }
+            if (result.ok) {
+                setState({ cache: { text: result.text, data: result.data } });
+                log('抢购成功! 请立即手动点击购买按钮!');
+                try { new Notification('GLM 抢购成功!', { body: `bizId=${state.bizId}` }); } catch {}
+                alert('已抢到! 请立即手动点击「特惠订阅」按钮完成支付!');
+            }
         }
     }
 
