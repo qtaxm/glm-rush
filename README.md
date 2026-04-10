@@ -1,4 +1,4 @@
-# GLM Coding 抢购助手 v4.6
+# GLM Coding 抢购助手 v4.5
 
 智谱 GLM Coding Plan 限时抢购自动化脚本（Tampermonkey 油猴脚本）
 
@@ -87,16 +87,8 @@
 
 ## 更新日志
 
-### v4.6 (2026-04-10)
-- **修复** clickButton 直接调用 Vue 组件的 `gotoPayFn()` 方法，彻底绕过 disabled 按钮限制
-- **验证** Playwright 实测确认 `gotoPayFn()` 能触发完整的 preview + check 流程
-
 ### v4.5 (2026-04-10)
-- **修复** 支付弹窗不弹出的核心问题：改用"先抢再喂"策略，retry 独立抢到 bizId 后缓存响应，再点击按钮让前端正常处理
-- **修复** `findBuyButton` 找错按钮（匹配到"即刻订阅"导航按钮），现在按优先级排序，优先找特惠/购买按钮
-- **修复** disabled 按钮点击无效：`clickButton` 强制解除 disabled 和 is-disabled class
-- **优化** 拦截器简化：去掉 proactive 分支，只做 cache 返回 + 普通捕获，逻辑更清晰
-- **优化** 按钮排除"即刻订阅"、"暂不"、"拼好模"等非购买按钮
+- **修复** `findBuyButton` 找错按钮（匹配到"即刻订阅"导航按钮），优先找 `buy-btn` 类按钮
 
 ### v4.4 (2026-04-09)
 - **新增** 极速模式：前 5 秒 10 路并发，之后降为 5 路
